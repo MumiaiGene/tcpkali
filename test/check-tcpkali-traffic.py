@@ -158,8 +158,7 @@ class Analyze(object):
         if total > 0:
             occurs = sum([v for (k, v) in d.items() if k <= n])
             return 100 * occurs // total
-        else:
-            return 0
+        return 0
 
     def debug(self):
         """Print the variables representing analyzed tcpkali output."""
@@ -182,14 +181,13 @@ def check_segmentation(prefix, lines, contains):
         print("Expected repetition of \"%s\" is not found in \"%s\"..." %
               (contains, allOutput[0:len(contains)+1]))
         return False
-    elif len(result.group(3)) == 0:
+    if not result.group(3):
         return True
-    else:
-        print("Output is not consistent after byte %d (...\"%s\");"
-              " continuing with \"%s\"..." %
-              (len(result.group(1)), result.group(2),
-               result.group(3)[0:len(contains)+1]))
-        return False
+    print("Output is not consistent after byte %d (...\"%s\");"
+          " continuing with \"%s\"..." %
+          (len(result.group(1)), result.group(2),
+           result.group(3)[0:len(contains)+1]))
+    return False
 
 
 def main():
@@ -200,8 +198,9 @@ def main():
     if os.environ.get('CONTINUOUS_INTEGRATION', 'false') == 'false':
         print("Correctness of data packetization")
         port = port + 1
+        # rate 162222 = 1460 (tapkali constant) * 1000 (hz) / 9 (message len)
         t = Tcpkali(["-l" + str(port), "127.1:" + str(port), "-T1",
-                     "-mFOOBARBAZ"], capture_io=True)
+                     "-mFOOBARBAZ", "-r162222"], capture_io=True)
         (_, errLines) = t.results()
         assert check_segmentation("Snd", errLines, "FOOBARBAZ")
 

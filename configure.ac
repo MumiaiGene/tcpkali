@@ -1,4 +1,4 @@
-AC_INIT([tcpkali],[1.1.1],[lwalkin@machinezone.com])
+AC_INIT([tcpkali],[1.2.0],[lwalkin@machinezone.com])
 
 AC_CONFIG_SRCDIR([src/tcpkali.c])
 AC_CONFIG_AUX_DIR(config)
@@ -32,6 +32,7 @@ m4_include([deps/libstatsd/libstatsd.m4])
 
 dnl Import locally defined macros.
 m4_include([m4/ax_check_compile_flag.m4])
+m4_include([m4/ax_check_openssl.m4])
 m4_include([m4/ax_make_optional_include.m4])
 
 AX_CHECK_GNU_STYLE_OPTIONAL_INCLUDE()
@@ -68,7 +69,7 @@ AC_ARG_WITH([libuv],
          [--with-libuv was given, but test for libuv failed])],
       [])])
 
-AC_CHECK_HEADERS(curses.h term.h)
+AC_CHECK_HEADERS(curses.h term.h termios.h)
 AC_CHECK_LIB([ncurses], [tgetent])
 
 dnl Enable Address Sanitizer, if supported by gcc (4.8+) or clang.
@@ -115,6 +116,20 @@ AC_ARG_ENABLE([tsan],
     dnl We can't do anything about this message in GCC; use clang.
   ])
 
+AX_CHECK_OPENSSL(
+    [AC_DEFINE([HAVE_OPENSSL], [1], [Define to 1 if you have OpenSSL])
+TK_LIBS="${OPENSSL_LIBS}"
+TK_LDFLAGS="${OPENSSL_LDFLAGS}"
+TK_CPPFLAGS="${OPENSSL_INCLUDES}"
+AC_CHECK_FUNC(SSL_CTX_set_ecdh_auto,
+        [AC_DEFINE([HAVE_SSL_CTX_SET_ECDH_AUTO], [1],
+            [Define to 1 if you have SSL_CTX_set_ecdh_auto function defined in OpenSSL])])
+    ],
+    [])
+AC_SUBST(TK_LIBS)
+AC_SUBST(TK_LDFLAGS)
+AC_SUBST(TK_CPPFLAGS)
+
 dnl We use pandoc to generate documentation.
 AC_PATH_PROG([PANDOC], pandoc)
 AM_CONDITIONAL([HAVE_PANDOC], [test -n "$PANDOC"])
@@ -135,6 +150,7 @@ dnl Shell linters
 AC_PATH_PROG([SHELLCHECK], shellcheck, [:])
 
 AC_CONFIG_FILES([Makefile
+                 asn1/Makefile
                  test/Makefile
                  src/Makefile
                  doc/Makefile

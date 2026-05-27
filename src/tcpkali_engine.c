@@ -64,76 +64,14 @@
 #include "tcpkali_expr.h"
 #include "tcpkali_data.h"
 #include "tcpkali_traffic_stats.h"
+#include "tcpkali_connection.h"
+#include "tcpkali_ssl.h"
 
 #ifndef TAILQ_FOREACH_SAFE
 #define TAILQ_FOREACH_SAFE(var, head, field, tvar) \
     for((var) = TAILQ_FIRST((head));               \
         (var) && ((tvar) = TAILQ_NEXT((var), field), 1); (var) = (tvar))
 #endif
-
-/*
- * A single connection is described by this structure (about 150 bytes).
- */
-struct connection {
-    tk_io watcher;
-    tk_timer timer;
-    off_t write_offset;
-    struct transport_data_spec data;
-    non_atomic_traffic_stats traffic_ongoing;  /* Connection-local numbers */
-    non_atomic_traffic_stats traffic_reported; /* Reported to worker */
-    float channel_eol_point; /* End of life time, since epoch */
-    struct pacefier send_pace;
-    struct pacefier recv_pace;
-    bandwidth_limit_t send_limit;
-    bandwidth_limit_t recv_limit;
-    enum {
-        CW_READ_INTEREST = 0x01,
-        CW_READ_BLOCKED = 0x10,
-        CW_WRITE_INTEREST = 0x02,
-        CW_WRITE_BLOCKED = 0x20,
-    } conn_wish : 8;
-    enum conn_type {
-        CONN_OUTGOING,
-        CONN_INCOMING,
-        CONN_ACCEPTOR,
-    } conn_type : 2;
-    enum conn_state {
-        CSTATE_CONNECTED,
-        CSTATE_CONNECTING,
-    } conn_state : 1;
-    enum {
-        WSTATE_SENDING_HTTP_UPGRADE,
-        WSTATE_WS_ESTABLISHED,
-    } ws_state : 1;
-    int16_t remote_index;                     /* \x ->
-                                                 loop_arguments.params.remote_addresses.addrs[x] */
-    non_atomic_narrow_t connection_unique_id; /* connection.uid */
-    TAILQ_ENTRY(connection) hook;
-    struct sockaddr_storage peer_name; /* For CONN_INCOMING */
-    /* Latency */
-    struct {
-        double connection_initiated;
-        struct ring_buffer *sent_timestamps;
-        struct hdr_histogram *marker_histogram;
-        unsigned message_bytes_credit; /* See (EXPL:1) below. */
-        unsigned lm_occurrences_skip;  /* See --latency-marker-skip */
-        /* Boyer-Moore-Horspool substring search algorithm data */
-        struct StreamBMH *sbmh_marker_ctx;
-        /* The following fields might be shared across connections. */
-        int sbmh_shared;
-        struct StreamBMH_Occ *sbmh_occ;
-        const uint8_t *sbmh_data;
-        size_t sbmh_size;
-        struct message_marker_parser_state {
-            enum {
-                MP_DISENGAGED,
-                MP_SLURPING_DIGITS
-            } state;
-            uint64_t collected_digits;
-        } marker_parser;
-    } latency;
-    struct StreamBMH *sbmh_stop_ctx;
-};
 
 struct loop_arguments {
     /**************************
@@ -286,6 +224,9 @@ static void debug_dump_data_highlight(const char *prefix, int fd,
                                       const void *data, size_t size,
                                       ssize_t limit, size_t hl_offset,
                                       size_t hl_length);
+static void
+latency_record_incoming_ts(TK_P_ struct connection *conn, char *buf,
+                           size_t size);
 
 #ifdef USE_LIBUV
 static void
@@ -358,10 +299,12 @@ engine_start(struct engine_params params) {
     enum transport_websocket_side tws_side;
     for(tws_side = TWS_SIDE_CLIENT; tws_side <= TWS_SIDE_SERVER; tws_side++) {
         assert(params.data_templates[tws_side] == NULL);
+        pcg32_random_t rng;
+        pcg32_srandom_r(&rng, random(), tws_side);
         params.data_templates[tws_side] =
             transport_spec_from_message_collection(
                 0, &params.message_collection, 0, 0, tws_side,
-                TS_CONVERSION_INITIAL);
+                TS_CONVERSION_INITIAL, &rng);
         assert(params.data_templates[tws_side]
                || params.message_collection.most_dynamic_expression
                       != DS_GLOBAL_FIXED);
@@ -518,15 +461,30 @@ estimate_pps(double duration, non_atomic_wide_t ops, non_atomic_wide_t bytes) {
 }
 
 void
-engine_update_message_send_rate(struct engine *eng, double msg_rate) {
+engine_update_workers_send_rate(struct engine *eng, rate_spec_t rate_spec) {
     /*
      * Ask workers to recompute per-connection rates.
      */
-    eng->params.channel_send_rate = RATE_MPS(msg_rate);
+    eng->params.channel_send_rate = rate_spec;
     for(int n = 0; n < eng->n_workers; n++) {
         int rc = write(eng->loops[n].private_control_pipe_wr, "r", 1);
         assert(rc == 1);
     }
+}
+
+rate_spec_t
+engine_set_message_send_rate(struct engine *eng, double msg_rate) {
+    rate_spec_t new_rate = RATE_MPS(msg_rate);
+    engine_update_workers_send_rate(eng, new_rate);
+    return new_rate;
+}
+
+rate_spec_t
+engine_update_send_rate(struct engine *eng, double multiplier) {
+    rate_spec_t new_rate = eng->params.channel_send_rate;
+    new_rate.value = new_rate.value * multiplier;
+    engine_update_workers_send_rate(eng, new_rate);
+    return new_rate;
 }
 
 /*
@@ -948,6 +906,7 @@ single_engine_loop_thread(void *argp) {
 
     signal(SIGPIPE, SIG_IGN);
 
+    tcpkali_ssl_thread_setup();
     /*
      * Open all listening sockets, if they are specified.
      */
@@ -990,8 +949,8 @@ single_engine_loop_thread(void *argp) {
             struct connection *conn = calloc(1, sizeof(*conn));
             conn->conn_type = CONN_ACCEPTOR;
             /* avoid TAILQ_INSERT_TAIL(&largs->open_conns, conn, hook); */
-            pacefier_init(&conn->send_pace, tk_now(TK_A));
-            pacefier_init(&conn->recv_pace, tk_now(TK_A));
+            pacefier_init(&conn->send_pace, -1.0, tk_now(TK_A));
+            pacefier_init(&conn->recv_pace, -1.0, tk_now(TK_A));
 #ifdef USE_LIBUV
             uv_poll_init(TK_A_ & conn->watcher, lsock);
             uv_poll_start(&conn->watcher, TK_READ | TK_WRITE, accept_cb_uv);
@@ -1235,18 +1194,25 @@ control_cb(TK_P_ tk_io *w, int UNUSED revents) {
     case 'r': /* Recompute message rate on live connections */
         largs->params.channel_send_rate =
             largs->shared_eng_params->channel_send_rate;
-        if(largs->params.channel_send_rate.value_base
-           == RS_MESSAGES_PER_SECOND) {
-            struct connection *conn;
+
+        struct connection *conn;
+        TAILQ_FOREACH(conn, &largs->open_conns, hook) {
+            conn->send_limit = compute_bandwidth_limit_by_message_size(
+                largs->params.channel_send_rate,
+                conn->avg_message_size);
+            double now = tk_now(TK_A);
+            if(conn->conn_type == CONN_OUTGOING
+                    || (largs->params.listen_mode & _LMODE_SND_MASK)) {
+                pacefier_init(&conn->send_pace, conn->send_limit.bytes_per_second, now);
+            }
+        }
+        if(largs->marker_histogram_local && largs->marker_histogram_shared) {
             pthread_mutex_lock(&largs->shared_histograms_lock);
             hdr_reset(largs->marker_histogram_local);
             hdr_reset(largs->marker_histogram_shared);
             pthread_mutex_unlock(&largs->shared_histograms_lock);
             TAILQ_FOREACH(conn, &largs->open_conns, hook) {
                 hdr_reset(conn->latency.marker_histogram);
-                conn->send_limit = compute_bandwidth_limit_by_message_size(
-                    largs->params.channel_send_rate,
-                    conn->data.single_message_size);
             }
         }
         break;
@@ -1322,7 +1288,7 @@ explode_data_template(struct message_collection *mc,
 
         struct transport_data_spec *new_data_ptr;
         new_data_ptr = transport_spec_from_message_collection(
-            out_data, mc, expr_callback, conn, tws_side, TS_CONVERSION_INITIAL);
+            out_data, mc, expr_callback, conn, tws_side, TS_CONVERSION_INITIAL, &largs->rng);
         assert(new_data_ptr == out_data);
 
         switch(mc->most_dynamic_expression) {
@@ -1344,24 +1310,24 @@ static void
 explode_data_template_override(struct message_collection *mc,
                                enum transport_websocket_side tws_side,
                                struct transport_data_spec *out_data,
-                               struct loop_arguments *largs UNUSED,
+                               struct loop_arguments *largs,
                                struct connection *conn) {
     assert(mc->most_dynamic_expression == DS_PER_MESSAGE);
 
     struct transport_data_spec *new_data_ptr;
     new_data_ptr = transport_spec_from_message_collection(
         out_data, mc, expr_callback, conn, tws_side,
-        TS_CONVERSION_OVERRIDE_MESSAGES);
+        TS_CONVERSION_OVERRIDE_MESSAGES, &largs->rng);
     assert(new_data_ptr == out_data);
 }
 
 static void
 explode_string_expression(char **buf_p, size_t *size, tk_expr_t *expr,
-                          struct loop_arguments *largs UNUSED,
+                          struct loop_arguments *largs,
                           struct connection *conn) {
     *buf_p = 0;
     ssize_t s = eval_expression(buf_p, 0, expr, expr_callback, conn, 0,
-                                conn->conn_type == CONN_OUTGOING);
+                                conn->conn_type == CONN_OUTGOING, &largs->rng);
     assert(s >= 0);
     *size = s;
 }
@@ -1519,13 +1485,20 @@ conn_timer_cb(TK_P_ tk_timer *w, int UNUSED revents) {
         switch(conn->conn_type) {
         case CONN_INCOMING:
             if((largs->params.listen_mode & _LMODE_SND_MASK) == 0) {
-                conn->conn_wish &= ~(CW_READ_BLOCKED | CW_WRITE_BLOCKED);
+                conn->conn_wish &=
+                    ~(CW_READ_BLOCKED | CW_WRITE_BLOCKED | CW_WRITE_DELAYED);
                 update_io_interest(TK_A_ conn);
                 break;
             }
         /* Fall through */
         case CONN_OUTGOING:
-            conn->conn_wish &= ~(CW_READ_BLOCKED | CW_WRITE_BLOCKED);
+            if(conn->conn_wish & CW_WRITE_DELAYED) {
+                /* Reinitialize the upstream bandwidth limit */
+                pacefier_init(&conn->send_pace,
+                              conn->send_limit.bytes_per_second, tk_now(TK_A));
+            }
+            conn->conn_wish &=
+                ~(CW_READ_BLOCKED | CW_WRITE_BLOCKED | CW_WRITE_DELAYED);
             update_io_interest(TK_A_ conn);
             break;
         case CONN_ACCEPTOR:
@@ -1596,6 +1569,35 @@ maybe_enable_dump(struct loop_arguments *largs, enum conn_type ctype, int fd) {
     }
 }
 
+
+static void
+connection_timer_refresh(TK_P_ struct connection *conn, double delay) {
+    struct loop_arguments *largs = tk_userdata(TK_A);
+
+    tk_timer_stop(TK_A, &conn->timer);
+
+    switch(conn->conn_state) {
+    case CSTATE_CONNECTED:
+        /* Use the supplied delay */
+        break;
+    case CSTATE_CONNECTING:
+        delay = largs->params.connect_timeout;
+        break;
+    }
+
+    if(delay > 0.0) {
+#ifdef USE_LIBUV
+        uv_timer_init(TK_A_ & conn->timer);
+        uint64_t uint_delay = 1000 * delay;
+        if(uint_delay == 0) uint_delay = 1;
+        uv_timer_start(&conn->timer, conn_timer_cb_uv, uint_delay, 0);
+#else
+        ev_timer_init(&conn->timer, conn_timer_cb, delay, 0.0);
+        ev_timer_start(TK_A_ & conn->timer);
+#endif
+    }
+}
+
 /*
  * Initialize common connection parameters.
  */
@@ -1611,9 +1613,8 @@ common_connection_init(TK_P_ struct connection *conn, enum conn_type conn_type,
 
     double now = tk_now(TK_A);
 
-    if(largs->params.latency_setting != 0) {
-        conn->latency.connection_initiated = now;
-    }
+    conn->latency.connection_initiated = now;
+    conn->bytes_leftovers = 0;
 
     if(limit_channel_lifetime(largs)) {
         if(TAILQ_FIRST(&largs->open_conns) == NULL) {
@@ -1628,8 +1629,8 @@ common_connection_init(TK_P_ struct connection *conn, enum conn_type conn_type,
      * Set up downstream bandwidth regardless of the type of connection.
      */
 
-    pacefier_init(&conn->recv_pace, now);
     conn->recv_limit = compute_bandwidth_limit(largs->params.channel_recv_rate);
+    pacefier_init(&conn->recv_pace, conn->recv_limit.bytes_per_second, now);
 
     /*
      * If we're going to send data, establish bandwidth control for upstream.
@@ -1637,70 +1638,79 @@ common_connection_init(TK_P_ struct connection *conn, enum conn_type conn_type,
 
     int active_socket = conn_type == CONN_OUTGOING
                         || (largs->params.listen_mode & _LMODE_SND_MASK);
-    if(active_socket || largs->params.message_marker) {
-        pacefier_init(&conn->send_pace, now);
 
+    if(active_socket) {
+
+        message_collection_replicate(&largs->params.message_collection, &conn->message_collection);
         enum transport_websocket_side tws_side =
             (conn_type == CONN_OUTGOING) ? TWS_SIDE_CLIENT : TWS_SIDE_SERVER;
-        explode_data_template(&largs->params.message_collection,
+        explode_data_template(&conn->message_collection,
                               largs->params.data_templates, tws_side,
                               &conn->data, largs, conn);
+        enum websocket_side ws_side =
+            (tws_side == TWS_SIDE_CLIENT) ? WS_SIDE_CLIENT : WS_SIDE_SERVER;
+        conn->avg_message_size = message_collection_estimate_size(
+            &conn->message_collection,
+            MSK_PURPOSE_MESSAGE, MSK_PURPOSE_MESSAGE,
+            MCE_AVERAGE_SIZE, ws_side, largs->params.websocket_enable);
         conn->send_limit = compute_bandwidth_limit_by_message_size(
-            largs->params.channel_send_rate, conn->data.single_message_size);
+            largs->params.channel_send_rate, conn->avg_message_size);
+        pacefier_init(&conn->send_pace, conn->send_limit.bytes_per_second, now);
         if(largs->params.message_stop_expr) {
             conn->sbmh_stop_ctx = malloc(SBMH_SIZE(largs->params.message_stop_expr->estimate_size));
             assert(conn->sbmh_stop_ctx);
             sbmh_init(conn->sbmh_stop_ctx, NULL, 0, 0);
         }
-        if(largs->params.latency_marker_expr && (conn->data.single_message_size || largs->params.message_marker)) {
-            if(conn->data.single_message_size) {
-                conn->latency.message_bytes_credit /* See (EXPL:1) below. */
-                    = conn->data.single_message_size - 1;
-            }
-            /*
-             * Figure out how many latency markers to skip
-             * before starting to measure latency with them.
-             */
-            conn->latency.lm_occurrences_skip =
-                largs->params.latency_marker_skip;
+    }
 
-            /*
-             * Initialize the Boyer-Moore-Horspool context for substring search.
-             */
-            struct StreamBMH_Occ *init_occ = NULL;
-            if(EXPR_IS_TRIVIAL(largs->params.latency_marker_expr)) {
-                /* Shared search table and expression */
-                conn->latency.sbmh_shared = 1;
-                conn->latency.sbmh_occ = &largs->params.sbmh_shared_marker_occ;
-                conn->latency.sbmh_data =
-                    (uint8_t *)largs->params.latency_marker_expr->u.data.data;
-                conn->latency.sbmh_size =
-                    largs->params.latency_marker_expr->u.data.size;
-            } else {
-                /* Individual search table. */
-                conn->latency.sbmh_shared = 0;
-                conn->latency.sbmh_occ =
-                    malloc(sizeof(*conn->latency.sbmh_occ));
-                assert(conn->latency.sbmh_occ);
-                init_occ = conn->latency.sbmh_occ;
-                explode_string_expression(
-                    (char **)&conn->latency.sbmh_data, &conn->latency.sbmh_size,
-                    largs->params.latency_marker_expr, largs, conn);
-            }
-            conn->latency.sbmh_marker_ctx =
-                malloc(SBMH_SIZE(conn->latency.sbmh_size));
-            assert(conn->latency.sbmh_marker_ctx);
-            sbmh_init(conn->latency.sbmh_marker_ctx, init_occ,
-                      conn->latency.sbmh_data, conn->latency.sbmh_size);
-
-            /*
-             * Initialize the latency histogram by copying out the template
-             * parameter from the loop arguments.
-             */
-            conn->latency.sent_timestamps = ring_buffer_new(sizeof(double));
-            conn->latency.marker_histogram =
-                hdr_init_similar(largs->marker_histogram_local);
+    if(largs->params.latency_marker_expr && (conn->data.single_message_size || largs->params.message_marker)) {
+        if(conn->data.single_message_size) {
+            conn->latency.message_bytes_credit /* See (EXPL:1) below. */
+                = conn->data.single_message_size - 1;
         }
+        /*
+         * Figure out how many latency markers to skip
+         * before starting to measure latency with them.
+         */
+        conn->latency.lm_occurrences_skip =
+            largs->params.latency_marker_skip;
+
+        /*
+         * Initialize the Boyer-Moore-Horspool context for substring search.
+         */
+        struct StreamBMH_Occ *init_occ = NULL;
+        if(EXPR_IS_TRIVIAL(largs->params.latency_marker_expr)) {
+            /* Shared search table and expression */
+            conn->latency.sbmh_shared = 1;
+            conn->latency.sbmh_occ = &largs->params.sbmh_shared_marker_occ;
+            conn->latency.sbmh_data =
+                (uint8_t *)largs->params.latency_marker_expr->u.data.data;
+            conn->latency.sbmh_size =
+                largs->params.latency_marker_expr->u.data.size;
+        } else {
+            /* Individual search table. */
+            conn->latency.sbmh_shared = 0;
+            conn->latency.sbmh_occ =
+                malloc(sizeof(*conn->latency.sbmh_occ));
+            assert(conn->latency.sbmh_occ);
+            init_occ = conn->latency.sbmh_occ;
+            explode_string_expression(
+                (char **)&conn->latency.sbmh_data, &conn->latency.sbmh_size,
+                largs->params.latency_marker_expr, largs, conn);
+        }
+        conn->latency.sbmh_marker_ctx =
+            malloc(SBMH_SIZE(conn->latency.sbmh_size));
+        assert(conn->latency.sbmh_marker_ctx);
+        sbmh_init(conn->latency.sbmh_marker_ctx, init_occ,
+                  conn->latency.sbmh_data, conn->latency.sbmh_size);
+
+        /*
+         * Initialize the latency histogram by copying out the template
+         * parameter from the loop arguments.
+         */
+        conn->latency.sent_timestamps = ring_buffer_new(sizeof(double));
+        conn->latency.marker_histogram =
+            hdr_init_similar(largs->marker_histogram_local);
     }
 
     /*
@@ -1710,16 +1720,7 @@ common_connection_init(TK_P_ struct connection *conn, enum conn_type conn_type,
                               && largs->params.connect_timeout > 0.0);
     if(want_catch_connect) {
         assert(conn_type == CONN_OUTGOING);
-#ifdef USE_LIBUV
-        uv_timer_init(TK_A_ & conn->timer);
-        uint64_t delay = 1000 * largs->params.connect_timeout;
-        if(delay == 0) delay = 1;
-        uv_timer_start(&conn->timer, conn_timer_cb_uv, delay, 0);
-#else
-        ev_timer_init(&conn->timer, conn_timer_cb,
-                      largs->params.connect_timeout, 0.0);
-        ev_timer_start(TK_A_ & conn->timer);
-#endif
+        connection_timer_refresh(TK_A_ conn, 0.0);
     }
 
     conn->conn_wish =
@@ -1746,7 +1747,6 @@ common_connection_init(TK_P_ struct connection *conn, enum conn_type conn_type,
             ev_io_start(TK_A_ & conn->watcher);
 #endif
         }
-        return;
     } else { /* Plain socket */
         int want_write = (conn->data.total_size || want_catch_connect);
         int want_events = TK_READ | (want_write ? TK_WRITE : 0);
@@ -1757,6 +1757,9 @@ common_connection_init(TK_P_ struct connection *conn, enum conn_type conn_type,
         ev_io_init(&conn->watcher, connection_cb, sockfd, want_events);
         ev_io_start(TK_A_ & conn->watcher);
 #endif
+    }
+    if(largs->params.ssl_enable != 0) {
+        ssl_setup(conn, sockfd, largs->params.ssl_cert, largs->params.ssl_key);
     }
 }
 
@@ -1918,7 +1921,7 @@ static enum lb_return_value {
     }
 
     size_t smallest_block_to_move = limit.minimal_move_size;
-    size_t allowed_to_move = pacefier_allow(pace, bw, tk_now(TK_A));
+    size_t allowed_to_move = pacefier_allow(pace, tk_now(TK_A));
 
     if(allowed_to_move < *suggested_move_size) {
         double delay;
@@ -1927,7 +1930,7 @@ static enum lb_return_value {
             if(allowed_to_move < smallest_block_to_move) {
                 /*   allowed     smallest|suggested
                    |------^-----------^-------^-------> */
-                delay = pacefier_when_allowed(pace, bw, tk_now(TK_A), 1460);
+                delay = pacefier_when_allowed(pace, tk_now(TK_A), 1460);
                 *suggested_move_size = 0;
                 rvalue = LB_GO_SLEEP;
             } else {
@@ -1964,14 +1967,7 @@ static enum lb_return_value {
 
         if(delay < 0.001) delay = 0.001;
 
-        tk_timer_stop(TK_A, &conn->timer);
-#ifdef USE_LIBUV
-        uv_timer_init(TK_A_ & conn->timer);
-        uv_timer_start(&conn->timer, conn_timer_cb_uv, 1000 * delay, 0.0);
-#else
-        ev_timer_init(&conn->timer, conn_timer_cb, delay, 0.0);
-        ev_timer_start(TK_A_ & conn->timer);
-#endif
+        connection_timer_refresh(TK_A_ conn, delay);
 
         return rvalue;
     }
@@ -1984,63 +1980,160 @@ passive_websocket_cb(TK_P_ tk_io *w, int revents) {
     struct loop_arguments *largs = tk_userdata(TK_A);
     struct connection *conn =
         (struct connection *)((char *)w - offsetof(struct connection, watcher));
+    char out_buf[200];
+    size_t response_size = 0;
 
-    if(revents & TK_READ) {
-        for(;;) {
-            ssize_t rd = read(tk_fd(w), largs->scratch_recv_buf,
-                              sizeof(largs->scratch_recv_buf));
-            switch(rd) {
-            case -1:
-                switch(errno) {
-                case EAGAIN:
-                    return;
-                default:
-                    close_connection(TK_A_ conn, CCR_REMOTE);
+    if(conn->conn_blocked & CBLOCKED_ON_INIT) {
+        if(((conn->conn_blocked & CBLOCKED_ON_READ) && (revents & TK_READ)) ||
+           ((conn->conn_blocked & CBLOCKED_ON_WRITE) && (revents & TK_WRITE))) {
+            if(conn->conn_blocked & CBLOCKED_ON_READ) {
+                revents &= ~TK_READ;
+            }
+            if(conn->conn_blocked & CBLOCKED_ON_WRITE) {
+                revents &= ~TK_WRITE;
+            }
+            if(ssl_setup(conn, 0, largs->params.ssl_cert, largs->params.ssl_key)) {
+                if(conn->conn_blocked & CBLOCKED_ON_INIT) {
+                    conn->conn_wish |= CW_READ_INTEREST;
+                    conn->conn_wish |= CW_WRITE_INTEREST;
+                    update_io_interest(TK_A_ conn);
                     return;
                 }
-            /* Fall through */
-            case 0:
+            } else {
                 close_connection(TK_A_ conn, CCR_REMOTE);
                 return;
-            default:
-                largs->scratch_recv_last_size = rd; /* Only update on >0 data */
-                conn->traffic_ongoing.num_reads++;
-                conn->traffic_ongoing.bytes_rcvd += rd;
-                if(largs->params.dump_setting & DS_DUMP_ALL_IN
-                   || ((largs->params.dump_setting & DS_DUMP_ONE_IN)
-                       && largs->dump_connect_fd == tk_fd(w))) {
-                    debug_dump_data("Rcv", tk_fd(w), largs->scratch_recv_buf,
-                                    rd, 0);
-                }
-
-                /*
-                 * Attempt to detect websocket key in HTTP and respond.
-                 */
-                switch(http_detect_websocket(tk_fd(w), largs->scratch_recv_buf,
-                                             rd)) {
-                case HDW_NOT_ENOUGH_DATA:
-                    return;
-                case HDW_WEBSOCKET_DETECTED:
-                    break;
-                case HDW_TRUNCATED_INPUT:
-                case HDW_UNEXPECTED_ERROR:
-                    close_connection(TK_A_ conn, CCR_DATA);
-                    return;
-                }
-                conn->ws_state = WSTATE_WS_ESTABLISHED;
-
-                int want_events = TK_READ | TK_WRITE;
-#ifdef USE_LIBUV
-                uv_poll_start(&conn->watcher, want_events, connection_cb_uv);
-#else
-                ev_io_stop(TK_A_ w);
-                ev_io_init(&conn->watcher, connection_cb, tk_fd(w),
-                           want_events);
-                ev_io_start(TK_A_ & conn->watcher);
-#endif
+            }
+        } else {
+            return;
+        }
+    }
+    if(revents & TK_WRITE) {
+        if(conn->conn_blocked & CBLOCKED_ON_READ) {
+            return;
+        }
+        conn->conn_blocked &= ~CBLOCKED_ON_WRITE;
+    }
+    if(revents & TK_READ) {
+        ssize_t rd = 0;
+        if(largs->params.ssl_enable) {
+#ifdef HAVE_OPENSSL
+            if(conn->conn_blocked & CBLOCKED_ON_WRITE) {
+                return;
+            }
+            conn->conn_blocked &= ~CBLOCKED_ON_READ;
+            rd = SSL_read(conn->ssl_fd, largs->scratch_recv_buf,
+                          sizeof(largs->scratch_recv_buf));
+            switch(SSL_get_error(conn->ssl_fd, rd)) {
+            case SSL_ERROR_NONE:
                 break;
+            case SSL_ERROR_WANT_WRITE:
+                conn->conn_blocked |= CBLOCKED_ON_WRITE;
+                return;
+            case SSL_ERROR_WANT_READ:
+                conn->conn_blocked |= CBLOCKED_ON_READ;
+                return;
+            case SSL_ERROR_ZERO_RETURN:
+            default:
+                rd = -1;  // Close it
+            }
+#endif
+        } else {
+            rd = read(tk_fd(w), largs->scratch_recv_buf,
+                      sizeof(largs->scratch_recv_buf));
+        }
+        switch(rd) {
+        case -1:
+            switch(errno) {
+            case EAGAIN:
+                return;
+            default:
+                close_connection(TK_A_ conn, CCR_REMOTE);
+                return;
+            }
+        /* Fall through */
+        case 0:
+            close_connection(TK_A_ conn, CCR_REMOTE);
+            return;
+        default:
+            largs->scratch_recv_last_size = rd; /* Only update on >0 data */
+            conn->traffic_ongoing.num_reads++;
+            conn->traffic_ongoing.bytes_rcvd += rd;
+            if(largs->params.dump_setting & DS_DUMP_ALL_IN
+               || ((largs->params.dump_setting & DS_DUMP_ONE_IN)
+                   && largs->dump_connect_fd == tk_fd(w))) {
+                debug_dump_data("Rcv", tk_fd(w), largs->scratch_recv_buf, rd,
+                                0);
+            }
+            latency_record_incoming_ts(TK_A_ conn, largs->scratch_recv_buf, rd);
+
+            /*
+             * Attempt to detect websocket key in HTTP and respond.
+             */
+            switch(http_detect_websocket(largs->scratch_recv_buf, rd, out_buf,
+                                         sizeof(out_buf), &response_size)) {
+            case HDW_NOT_ENOUGH_DATA:
+                return;
+            case HDW_WEBSOCKET_DETECTED:
+                conn->ws_state = WSTATE_WS_ESTABLISHED;
+                break;
+            case HDW_TRUNCATED_INPUT:
+            case HDW_UNEXPECTED_ERROR:
+                close_connection(TK_A_ conn, CCR_DATA);
+                return;
+            }
+            break;
+        }
+    }
+    if((conn->ws_state == WSTATE_WS_ESTABLISHED) && !conn->conn_blocked) {
+        if(!response_size) {
+            switch(http_detect_websocket(largs->scratch_recv_buf,
+                                  largs->scratch_recv_last_size, out_buf,
+                                  sizeof(out_buf), &response_size)) {
+            case HDW_NOT_ENOUGH_DATA:
+            case HDW_WEBSOCKET_DETECTED:
+                break;
+            case HDW_TRUNCATED_INPUT:
+            case HDW_UNEXPECTED_ERROR:
+                close_connection(TK_A_ conn, CCR_DATA);
+                return;
             }
         }
+        if(largs->params.ssl_enable) {
+#ifdef HAVE_OPENSSL
+            int wrote = SSL_write(conn->ssl_fd, out_buf, response_size);
+            switch(SSL_get_error(conn->ssl_fd, wrote)) {
+            case SSL_ERROR_NONE:
+                break;
+            case SSL_ERROR_WANT_WRITE:
+                conn->conn_blocked |= CBLOCKED_ON_WRITE;
+                return;
+            case SSL_ERROR_WANT_READ:
+                conn->conn_blocked |= CBLOCKED_ON_READ;
+                return;
+            case SSL_ERROR_ZERO_RETURN:
+            default:
+                wrote = -1;  // Close it
+            }
+            if(wrote != (ssize_t)response_size) {
+                close_connection(TK_A_ conn, CCR_DATA);
+                return;
+            }
+#endif
+        } else {
+            if(write(tk_fd(w), out_buf, response_size)
+               != (ssize_t)response_size) {
+                close_connection(TK_A_ conn, CCR_DATA);
+                return;
+            }
+        }
+        int want_events = TK_READ | TK_WRITE;
+#ifdef USE_LIBUV
+        uv_poll_start(&conn->watcher, want_events, connection_cb_uv);
+#else
+        ev_io_stop(TK_A_ w);
+        ev_io_init(&conn->watcher, connection_cb, tk_fd(w), want_events);
+        ev_io_start(TK_A_ & conn->watcher);
+#endif
     }
 }
 
@@ -2052,7 +2145,8 @@ update_io_interest(TK_P_ struct connection *conn) {
     events |= (conn->conn_wish & CW_WRITE_INTEREST) ? TK_WRITE : 0;
     /* Remove read or write wish, if we are blocked on them */
     events &= ~((conn->conn_wish & CW_READ_BLOCKED) ? TK_READ : 0);
-    events &= ~((conn->conn_wish & CW_WRITE_BLOCKED) ? TK_WRITE : 0);
+    events &= ~((conn->conn_wish & (CW_WRITE_BLOCKED | CW_WRITE_DELAYED))
+                ? TK_WRITE : 0);
 
 #ifdef USE_LIBUV
     (void)loop;
@@ -2065,19 +2159,14 @@ update_io_interest(TK_P_ struct connection *conn) {
 }
 
 static void
-latency_record_outgoing_ts(TK_P_ struct connection *conn, const void *new_position, size_t wrote) {
+latency_record_outgoing_ts(TK_P_ struct connection *conn, size_t wrote) {
     struct loop_arguments *largs = tk_userdata(TK_A);
 
     if(largs->params.message_marker) {
-        const void *token = conn->data.marker_token_ptr;
-        const void *position = new_position - wrote;
-        if(token) {
-            if(position <= token && token < position + wrote) {
-                conn->traffic_ongoing.msgs_sent++;
+            if (conn->avg_message_size > 0) {
+                conn->traffic_ongoing.msgs_sent += (conn->bytes_leftovers + wrote) / conn->avg_message_size;
+                conn->bytes_leftovers = (conn->bytes_leftovers + wrote) % conn->avg_message_size;
             }
-        } else {
-                conn->traffic_ongoing.msgs_sent++;
-        }
         return;
     }
 
@@ -2263,10 +2352,11 @@ scan_incoming_bytes(TK_P_ struct connection *conn, char *buf, size_t size) {
 
 
 static void override_timestamp(char *ptr, size_t size, unsigned long long ts) {
-    assert(size >= (sizeof(MESSAGE_MARKER_TOKEN)-1) + 16 + 1);
+    const size_t mmt_len = sizeof(MESSAGE_MARKER_TOKEN) - 1;
+    assert(size >= mmt_len + 16 + 1);
     assert(ptr[0] == MESSAGE_MARKER_TOKEN[0]);
-    ptr += sizeof(MESSAGE_MARKER_TOKEN) - 1;
-    snprintf(ptr, size, "%016llx", ts);
+    ptr += mmt_len;
+    snprintf(ptr, size - mmt_len, "%016llx", ts);
     ptr[16] = '.';
 }
 
@@ -2329,11 +2419,11 @@ largest_contiguous_chunk(struct loop_arguments *largs, struct connection *conn,
         *available_body = available - *available_header;
     } else {
         /* If we're at the end of the buffer, re-blow it with new messages */
-        if(largs->params.message_collection.most_dynamic_expression
+        if(conn->message_collection.most_dynamic_expression
                == DS_PER_MESSAGE
            && (conn->conn_type == CONN_OUTGOING
                || (largs->params.listen_mode & _LMODE_SND_MASK))) {
-            explode_data_template_override(&largs->params.message_collection,
+            explode_data_template_override(&conn->message_collection,
                                            (conn->conn_type == CONN_OUTGOING)
                                                ? TWS_SIDE_CLIENT
                                                : TWS_SIDE_SERVER,
@@ -2348,15 +2438,14 @@ largest_contiguous_chunk(struct loop_arguments *largs, struct connection *conn,
     }
 
     if(largs->params.message_marker) {
-        if(conn->data.marker_token_ptr >= *position) {
+        if(*position < conn->data.marker_token_ptr) {
             /* Short-circquit search: we know where marker is, directly. */
             struct timeval tp;
             gettimeofday(&tp, NULL);
             unsigned long long ts =
                 (unsigned long long)tp.tv_sec * 1000000 + tp.tv_usec;
-            size_t offset = conn->data.marker_token_ptr - *position;
             override_timestamp(conn->data.marker_token_ptr,
-                               (*available_body) - offset, ts);
+                               (*available_body), ts);
         } else {
             /* Do a string search to find our markers and update timestamps */
             update_timestamps((char *)*position, *available_body);
@@ -2374,6 +2463,29 @@ connection_cb(TK_P_ tk_io *w, int revents) {
             ? &largs->params.remote_addresses.addrs[conn->remote_index]
             : &conn->peer_name;
 
+    if(conn->conn_blocked & CBLOCKED_ON_INIT) {
+        if(((conn->conn_blocked & CBLOCKED_ON_READ) && (revents & TK_READ)) ||
+           ((conn->conn_blocked & CBLOCKED_ON_WRITE) && (revents & TK_WRITE))) {
+            if(conn->conn_blocked & CBLOCKED_ON_READ) {
+                revents &= ~TK_READ;
+            }
+            if(conn->conn_blocked & CBLOCKED_ON_WRITE) {
+                revents &= ~TK_WRITE;
+            }
+            if(ssl_setup(conn, 0, largs->params.ssl_cert, largs->params.ssl_key)) {
+                if(conn->conn_blocked & CBLOCKED_ON_INIT) {
+                    conn->conn_wish |= CW_READ_INTEREST;
+                    conn->conn_wish |= CW_WRITE_INTEREST;
+                    update_io_interest(TK_A_ conn);
+                    return;
+                }
+            } else {
+                close_connection(TK_A_ conn, CCR_REMOTE);
+            }
+        } else {
+            return;
+        }
+    }
     if(conn->conn_state == CSTATE_CONNECTING) {
         /*
          * Extended channel lifetimes are managed elsewhere, but zero
@@ -2399,7 +2511,7 @@ connection_cb(TK_P_ tk_io *w, int revents) {
          * If there's nothing to write, we remove the write interest.
          */
         tk_timer_stop(TK_A, &conn->timer);
-        if(conn->data.total_size == 0) {
+        if((conn->data.total_size == 0) && !(conn->conn_blocked & CBLOCKED_ON_WRITE)) {
             conn->conn_wish &= ~CW_WRITE_INTEREST; /* Remove write interest */
             update_io_interest(TK_A_ conn);
             revents &= ~TK_WRITE; /* Don't actually write in this loop */
@@ -2424,14 +2536,45 @@ connection_cb(TK_P_ tk_io *w, int revents) {
                     record_moved_data = 1;
                     break;
                 case LB_GO_SLEEP:
-                    conn->conn_wish |= CW_READ_BLOCKED;
-                    update_io_interest(TK_A_ conn);
-                    goto process_WRITE;
+                    if(!(conn->conn_blocked & CBLOCKED_ON_READ)) {
+                        conn->conn_wish |= CW_READ_BLOCKED;
+                        update_io_interest(TK_A_ conn);
+                        goto process_WRITE;
+                    }
                 }
             }
 
             assert(read_size > 0);
-            ssize_t rd = read(tk_fd(w), largs->scratch_recv_buf, read_size);
+            ssize_t rd = 0;
+            if(largs->params.ssl_enable) {
+#ifdef HAVE_OPENSSL
+                if(conn->conn_blocked & CBLOCKED_ON_WRITE) {
+                    goto process_WRITE;
+                }
+                conn->conn_blocked &= ~CBLOCKED_ON_READ;
+                rd = SSL_read(conn->ssl_fd, largs->scratch_recv_buf, read_size);
+                switch(SSL_get_error(conn->ssl_fd, rd)) {
+                case SSL_ERROR_NONE:
+                    break;
+                case SSL_ERROR_WANT_WRITE:
+                    conn->conn_blocked |= CBLOCKED_ON_WRITE;
+                    conn->conn_wish |= CW_WRITE_INTEREST;
+                    update_io_interest(TK_A_ conn);
+                    goto process_WRITE;
+                    break;
+                case SSL_ERROR_WANT_READ:
+                    conn->conn_blocked |= CBLOCKED_ON_READ;
+                    conn->conn_wish |= CW_READ_INTEREST;
+                    update_io_interest(TK_A_ conn);
+                    return;
+                case SSL_ERROR_ZERO_RETURN:
+                default:
+                    rd = -1;  // Close it
+                }
+#endif
+            } else {
+                rd = read(tk_fd(w), largs->scratch_recv_buf, read_size);
+            }
             switch(rd) {
             case -1:
                 switch(errno) {
@@ -2491,9 +2634,7 @@ connection_cb(TK_P_ tk_io *w, int revents) {
                 scan_incoming_bytes(TK_A_ conn, largs->scratch_recv_buf, rd);
 
                 if(record_moved_data) {
-                    pacefier_moved(&conn->recv_pace,
-                                   conn->recv_limit.bytes_per_second, rd,
-                                   tk_now(TK_A));
+                    pacefier_moved(&conn->recv_pace, rd, tk_now(TK_A));
                 }
                 break;
             }
@@ -2509,7 +2650,7 @@ process_WRITE:
 
         largest_contiguous_chunk(largs, conn, &position, &available_header,
                                  &available_body);
-        if(!(available_header + available_body)) {
+        if(!(available_header + available_body) && !(conn->conn_blocked & CBLOCKED_ON_WRITE)) {
             /* Only the header was sent. Now, silence. */
             assert(conn->data.total_size == conn->data.once_size
                    || largs->params.websocket_enable);
@@ -2529,12 +2670,20 @@ process_WRITE:
             record_moved = 1;
             break;
         case LB_GO_SLEEP:
-            if(available_header) break;
+            if(available_header || (conn->conn_blocked & CBLOCKED_ON_WRITE)) break;
             conn->conn_wish |= CW_WRITE_BLOCKED;
             update_io_interest(TK_A_ conn);
             return;
         }
 
+        if((largs->params.delay_send > 0.0
+            && largs->params.delay_send
+                   > tk_now(TK_A) - conn->latency.connection_initiated)) {
+            conn->conn_wish |= CW_WRITE_DELAYED;
+            update_io_interest(TK_A_ conn);
+            connection_timer_refresh(TK_A_ conn, largs->params.delay_send);
+            return;
+        }
         do { /* Write de-coalescing loop */
             size_t available_write =
                 available_header
@@ -2544,7 +2693,35 @@ process_WRITE:
                              ? available_body
                              : conn->send_limit.minimal_move_size);
 
-            ssize_t wrote = write(tk_fd(w), position, available_write);
+            ssize_t wrote = 0;
+            if(largs->params.ssl_enable) {
+#ifdef HAVE_OPENSSL
+                if(conn->conn_blocked & CBLOCKED_ON_READ) {
+                    return;
+                }
+                conn->conn_blocked &= ~CBLOCKED_ON_WRITE;
+                wrote = SSL_write(conn->ssl_fd, position, available_write);
+                switch(SSL_get_error(conn->ssl_fd, wrote)) {
+                case SSL_ERROR_NONE:
+                    break;
+                case SSL_ERROR_WANT_WRITE:
+                    conn->conn_blocked |= CBLOCKED_ON_WRITE;
+                    conn->conn_wish |= CW_WRITE_INTEREST;
+                    update_io_interest(TK_A_ conn);
+                    return;
+                case SSL_ERROR_WANT_READ:
+                    conn->conn_blocked |= CBLOCKED_ON_READ;
+                    conn->conn_wish |= CW_READ_INTEREST;
+                    update_io_interest(TK_A_ conn);
+                    return;
+                case SSL_ERROR_ZERO_RETURN:
+                default:
+                    wrote = -1;  // Close it
+                }
+#endif
+            } else {
+                wrote = write(tk_fd(w), position, available_write);
+            }
             if(wrote == -1) {
                 char buf[INET6_ADDRSTRLEN + 64];
                 switch(errno) {
@@ -2570,9 +2747,7 @@ process_WRITE:
                 conn->traffic_ongoing.num_writes++;
                 conn->traffic_ongoing.bytes_sent += wrote;
                 if(record_moved)
-                    pacefier_moved(&conn->send_pace,
-                                   conn->send_limit.bytes_per_second, wrote,
-                                   tk_now(TK_A));
+                    pacefier_moved(&conn->send_pace, wrote, tk_now(TK_A));
                 if(largs->params.dump_setting & DS_DUMP_ALL_OUT
                    || ((largs->params.dump_setting & DS_DUMP_ONE_OUT)
                        && largs->dump_connect_fd == tk_fd(w))) {
@@ -2585,7 +2760,7 @@ process_WRITE:
                     available_body -= wrote;
 
                     /* Record latencies for the body only, not headers */
-                    latency_record_outgoing_ts(TK_A_ conn, position, wrote);
+                    latency_record_outgoing_ts(TK_A_ conn, wrote);
                 }
             }
         } while(available_body);
@@ -2675,6 +2850,14 @@ connection_free_internals(struct connection *conn) {
     if(conn->sbmh_stop_ctx) {
         free(conn->sbmh_stop_ctx);
     }
+
+    message_collection_free(&conn->message_collection);
+
+#ifdef HAVE_OPENSSL
+    if(conn->ssl_ctx) {
+        SSL_CTX_free(conn->ssl_ctx);
+    }
+#endif
 }
 
 /*

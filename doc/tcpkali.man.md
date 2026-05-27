@@ -82,6 +82,15 @@ open more than 64k connections to destinations.
 --ws, --websocket
 :   Use RFC6455 WebSocket transport.
 
+--ssl
+:   Enable Transport Layer Security (TLS, formerly known as SSL) for client-side and server-side connections.
+
+--ssl-cert *filename*
+:   The X.509 certificate file for TLS termination. Default is "cert.pem".
+
+--ssl-key *filename*
+:   The private key file for TLS termination. Default is "key.pem".
+
 -H, --header
 :   Add HTTP header into the WebSocket handshake.
 
@@ -112,6 +121,9 @@ open more than 64k connections to destinations.
 
 -T, --duration *Time*
 :   Exit and print final stats after the specified amount of time. Default is 10 seconds (`-T10s`).
+
+--delay-send *Time*
+:   Delay sending bytes by a specified amount of time.
 
 ## TRAFFIC CONTENT OPTIONS
 

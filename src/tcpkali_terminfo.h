@@ -30,10 +30,16 @@
 /*
  * Initialize smart terminal.
  * RETURN VALUES: -1 for error (dumb terminal), 0 for OK.
+ * In case of -1, the (*note) will contain an explanation note.
  */
-int tcpkali_init_terminal(void);
+int tcpkali_init_terminal(const char **note);
+
+void tcpkali_init_kbdinput();
+int tcpkali_kbdinput_initialized();
 
 void tcpkali_disable_cursor(void);
+
+int tcpkali_terminal_initialized(void);
 
 /*
  * Capability "clr_eol":
@@ -57,5 +63,15 @@ int tcpkali_terminal_width();
  */
 enum tk_attribute { TKA_NORMAL, TKA_WARNING, TKA_HIGHLIGHT, TKA_SndBrace, TKA_RcvBrace };
 const char *tk_attr(enum tk_attribute);
+
+enum keyboard_event {
+    KE_NOTHING,
+    KE_UP_ARROW,
+    KE_DOWN_ARROW,
+    KE_ENTER,
+    KE_Q
+};
+
+enum keyboard_event tcpkali_kbdhit(void);
 
 #endif /* TCPKALI_TERMINFO_H */

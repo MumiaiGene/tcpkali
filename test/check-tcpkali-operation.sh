@@ -1,8 +1,6 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
-if [ -z "${CONTINUOUS_INTEGRATION}" ]; then
-    set -o pipefail
-fi
+set -o pipefail
 set -e
 
 if [ -z "${TCPKALI}" ]; then
@@ -15,37 +13,56 @@ if [ -n "$1" ]; then
     echo "Selected test ${use_test_no}"
 fi
 
+TMPFILE=/tmp/check-tcpkali-output.$$
+rmtmp() {
+    local lines
+    lines=$(wc -l ${TMPFILE} | awk '{print $1}')
+    if [ ${lines} -gt 150 ]; then
+        echo "First 50 lines of tcpkali output (total ${lines}):"
+        head -50 ${TMPFILE}
+        echo "Last 50 lines of tcpkali output (total ${lines}):"
+        tail -50 ${TMPFILE}
+    else
+        echo "All ${lines} lines of tcpkali output:"
+        cat ${TMPFILE}
+    fi
+    echo "Removing temporary file ${TMPFILE}."
+    rm -f ${TMPFILE}
+}
+trap rmtmp EXIT
+touch ${TMPFILE}
+
 PORT=1230
 
 check() {
     local testno="$1"
     local togrep="$2"
-    shift 2
+    local command="$3"
+    shift 3
 
-    if [ -n "${use_test_no}" -a "${testno}" != "${use_test_no}" ]; then
+    if [ -n "${use_test_no}" ] && [ "${testno}" != "${use_test_no}" ]; then
         return
     fi
 
     PORT=$((PORT+1))
-    local rest_opts="-T1s --source-ip 127.1 -l127.1:${PORT} 127.1:${PORT}"
-    echo "Test ${testno}.srcip: $* ${rest_opts}" >&2
-    "$@" ${rest_opts} 2>&1 | egrep "$togrep"
-    PORT=$((PORT+1))
-    local rest_opts="-T1s -l${PORT} 127.1:${PORT}"
-    echo "Test ${testno}.autoip: $* ${rest_opts}" >&2
-    "$@" ${rest_opts} 2>&1 | egrep "$togrep"
+    local rest_opts
+    rest_opts="-T1s -l127.1:${PORT} 127.1:${PORT}"
+    echo "Test ${testno}.autoip: $* ${rest_opts}" | tee ${TMPFILE} >&2
+    echo "Looking for \"$togrep\" in '${command} ${rest_opts} $*'" >> ${TMPFILE}
+    local out
+    out=$(${command} ${rest_opts} "$@" 2>&1 | tee -a ${TMPFILE} | grep -E -c "$togrep")
+    [ $out -ne 0 ] || exit 1
 }
 
+check 1 "." ${TCPKALI} -vv --connections=20 --duration=1
+check 2 "." ${TCPKALI} -vv --connections=10 --duration=1 -m Z
+check 3 "." ${TCPKALI} -vv -c10 --message Z --message-rate=2
+check 4 "." ${TCPKALI} -vv -c10 -m Z --channel-bandwidth-upstream=10kbps
 
-check 1 "." ${TCPKALI} --connections=20 --duration=1
-check 2 "." ${TCPKALI} --connections=10 --duration=1 -m Z
-check 3 "." ${TCPKALI} -c10 --message Z --message-rate=2
-check 4 "." ${TCPKALI} -c10 -m Z --channel-bandwidth-upstream=10kbps
-
-check 5 "Total data sent:[ ]+149 bytes"     ${TCPKALI} --ws
-check 6 "Total data received:[ ]+278 bytes" ${TCPKALI} --ws
-check 7 "Total data sent:[ ]+158 bytes"     ${TCPKALI} --ws --first-message ABC
-check 8 "Total data received:[ ]+287 bytes" ${TCPKALI} --ws --first-message ABC
+check 5 "Total data sent:[ ]+149 bytes"     ${TCPKALI} -vv --ws -w2
+check 6 "Total data received:[ ]+278 bytes" ${TCPKALI} -vv --ws -w2
+check 7 "Total data sent:[ ]+158 bytes"     ${TCPKALI} -vv --ws --first-message ABC -w2
+check 8 "Total data received:[ ]+287 bytes" ${TCPKALI} -vv --ws -1 ABC -w2
 
 check 9 "." ${TCPKALI} --ws --message ABC
 check 10 "." ${TCPKALI} --ws --first-message ABC --message foo
@@ -77,5 +94,9 @@ for size_k in 63 65 1000; do
 done
 rm_testfile
 
-check 24 "Packet rate estimate: (19|20)" ${TCPKALI} -m 'Foo\{message.marker}' -r10
-check 25 "Packet rate estimate: (19|20)" ${TCPKALI} --ws -m '\{message.marker}\{re [a-z]{1,300}}' -r10
+check 24 "Packet rate estimate: (10)" ${TCPKALI} -m 'Foo\{message.marker}' -r10 --duration=5s
+check 25 "Packet rate estimate: (10)" ${TCPKALI} --ws -m '\{message.marker}\{re [a-z]{1,300}}' -r10 --duration=5s
+
+check 26 "." ${TCPKALI} -1 '\{message.marker}' -m '\{message.marker}'
+
+trap 'rm -f ${TMPFILE}' EXIT

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015  Machine Zone, Inc.
+ * Copyright (c) 2015-2017  Machine Zone, Inc.
  *
  * Original author: Lev Walkin <lwalkin@machinezone.com>
  *
@@ -34,13 +34,22 @@
 
 #ifdef HAVE_CURSES_H
 #include <curses.h>
+
+#include <unistd.h>
+#include <fcntl.h>
+
 #endif
 #ifdef HAVE_TERM_H
 #include <term.h>
 #endif
+#ifdef HAVE_TERMIOS_H
+#include <termios.h>
+#endif
 
 #include "tcpkali_common.h"
 #include "tcpkali_terminfo.h"
+
+#include "TcpkaliMessage.h"
 
 static int terminal_initialized = 0;
 static int int_utf8 = 0;
@@ -51,6 +60,7 @@ static char tka_rcvbrace[16];
 static char tka_warn[16];
 static char tka_highlight[16];
 static char tka_normal[16];
+static int kbdinput_initialized = 0;
 
 const char *
 tk_attr(enum tk_attribute tka) {
@@ -87,6 +97,8 @@ tcpkali_is_utf8() {
 
 #ifdef HAVE_LIBNCURSES
 
+static struct termios initial_term_attr;
+
 static char *
 cap(char *cap) {
     return tgetstr(cap, 0) ?: "";
@@ -108,14 +120,14 @@ int
 tcpkali_terminal_width(void) {
     if(terminal_width_changed) {
         terminal_width_changed = 0;
-        tcpkali_init_terminal();
+        tcpkali_init_terminal(NULL);
     }
     return terminal_width;
 }
 
 void
 tcpkali_disable_cursor(void) {
-    if(tcpkali_init_terminal() == 0) {
+    if(tcpkali_init_terminal(NULL) == 0) {
         /* Disable cursor */
         printf("%s", cap("vi"));
         atexit(enable_cursor);
@@ -123,17 +135,38 @@ tcpkali_disable_cursor(void) {
 }
 
 int
-tcpkali_init_terminal(void) {
+tcpkali_init_terminal(const char **note) {
 #define NOT_INITIALIZED 1   /**/
     static int terminal_init_response = NOT_INITIALIZED;
-    int errret = 0;
+    static char *error_note = NULL;
 
     if(terminal_init_response != NOT_INITIALIZED) {
+        if(note) *note = error_note;
         return terminal_init_response;
     }
 
+    int errret = 0;
     if(setupterm(NULL, 1, &errret) == ERR) {
         terminal_init_response = -1;
+        switch(errret) { /* man setupterm specifies 1,0,-1. */
+        case 1:
+            error_note = "(setupterm() says terminal is hardcopy)";
+            break;
+        case 0:
+            error_note = "(setupterm() failed to find a terminal)";
+            break;
+        case -1:
+        default:
+            if(getenv("TERM")) {
+                error_note = "(setupterm() failed)";
+            } else {
+                error_note = "(no \"TERM\" environment)";
+            }
+            break;
+        }
+        if(note) {
+            *note = error_note;
+        }
         return -1;
     } else {
         setvbuf(stdout, 0, _IONBF, 0);
@@ -180,11 +213,65 @@ tcpkali_init_terminal(void) {
     return 0;
 }
 
+void
+tcpkali_reset_kbdinput() {
+    if(kbdinput_initialized) {
+        kbdinput_initialized = 0;
+        tcsetattr(STDIN_FILENO, TCSANOW, &initial_term_attr);
+    }
+}
+
+void
+tcpkali_init_kbdinput() {
+    struct termios oldt, newt;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    initial_term_attr = oldt;
+    kbdinput_initialized = 1;
+    atexit(tcpkali_reset_kbdinput);
+}
+
+int
+tcpkali_kbdinput_initialized() {
+    return kbdinput_initialized;
+}
+
+enum keyboard_event
+tcpkali_kbdhit(void)
+{
+    if(!kbdinput_initialized) return KE_NOTHING;
+
+    switch(getchar()) {
+    case 'k': return KE_UP_ARROW;
+    case 'j': return KE_DOWN_ARROW;
+    case '\n': return KE_ENTER;
+    case 'q': return KE_Q;
+    }
+    return KE_NOTHING;
+}
+
 #else /* !HAVE_LIBNCURSES */
 
 int
-tcpkali_init_terminal(void) {
+tcpkali_init_terminal(const char **note) {
+    if(note) *note = "(not compiled with ncurses library)";
     return -1;
+}
+
+void
+tcpkali_init_kbdinput() {
+    kbdinput_initialized = 0;
+}
+
+int
+tcpkali_kbdinput_initialized() {
+    return kbdinput_initialized;
+}
+
+void
+tcpkali_teardown_terminal() {
 }
 
 void
@@ -195,6 +282,11 @@ tcpkali_disable_cursor(void) {
 int
 tcpkali_terminal_width(void) {
     return terminal_width;
+}
+
+enum keyboard_event
+tcpkali_kbdhit(void) {
+    return KE_NOTHING;
 }
 
 #endif /* HAVE_LIBNCURSES */

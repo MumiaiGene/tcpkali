@@ -57,6 +57,7 @@
 #include "tcpkali_transport.h"
 #include "tcpkali_syslimits.h"
 #include "tcpkali_logging.h"
+#include "tcpkali_ssl.h"
 
 /*
  * Describe the command line options.
@@ -68,6 +69,7 @@
 #define CLI_SOCKET_OPT (1 << 12)
 #define CLI_LATENCY (1 << 13)
 #define CLI_DUMP (1 << 14)
+#define SSL_OPT (1 << 15)
 static struct option cli_long_options[] = {
     {"channel-lifetime", 1, 0, CLI_CHAN_OFFSET + 't'},
     {"channel-bandwidth-upstream", 1, 0, 'U'},
@@ -75,6 +77,7 @@ static struct option cli_long_options[] = {
     {"connections", 1, 0, 'c'},
     {"connect-rate", 1, 0, 'R'},
     {"connect-timeout", 1, 0, CLI_CONN_OFFSET + 't'},
+    {"delay-send", 1, 0, CLI_CONN_OFFSET + 'z'},
     {"duration", 1, 0, 'T'},
     {"dump-one", 0, 0, CLI_DUMP + '1'},
     {"dump-one-in", 0, 0, CLI_DUMP + 'i'},
@@ -99,8 +102,12 @@ static struct option cli_long_options[] = {
     {"message-stop", 1, 0, 's'},
     {"nagle", 1, 0, 'N'},
     {"rcvbuf", 1, 0, CLI_SOCKET_OPT + 'R'},
+    {"server", 1, 0, 'S'},
     {"sndbuf", 1, 0, CLI_SOCKET_OPT + 'S'},
     {"source-ip", 1, 0, 'I'},
+    {"ssl", 0, 0, SSL_OPT},
+    {"ssl-cert", 1, 0, SSL_OPT + 'c'},
+    {"ssl-key", 1, 0, SSL_OPT + 'k'},
     {"statsd", 0, 0, CLI_STATSD_OFFSET + 'e'},
     {"statsd-host", 1, 0, CLI_STATSD_OFFSET + 'h'},
     {"statsd-port", 1, 0, CLI_STATSD_OFFSET + 'p'},
@@ -207,10 +214,18 @@ main(int argc, char **argv) {
     struct engine_params engine_params = {.verbosity_level = DBG_ERROR,
                                           .connect_timeout = 1.0,
                                           .channel_lifetime = INFINITY,
+                                          .delay_send = 0.0,
                                           .nagle_setting = NSET_UNSET,
+                                          .ssl_enable = 0,
+                                          .ssl_cert = "cert.pem",
+                                          .ssl_key = "key.pem",
                                           .write_combine = WRCOMB_ON};
     struct rate_modulator rate_modulator = {.state = RM_UNMODULATED};
     int unescape_message_data = 0;
+
+    struct orchestration_args orch_args = {.enabled = 0,
+                                           .server_addrs = NULL,
+                                           .server_addr_str = NULL};
 
 #ifdef HAVE_SRANDOMDEV
     srandomdev();
@@ -233,11 +248,14 @@ main(int argc, char **argv) {
         case 'V':
             printf(PACKAGE_NAME " version " VERSION
 #ifdef USE_LIBUV
-                                " (libuv)"
+                                " (libuv"
 #else
-                                " (libev)"
+                                " (libev"
 #endif
-                                "\n");
+#ifdef HAVE_OPENSSL
+                                ", ssl"
+#endif
+                                ")\n");
             exit(0);
         case 'h':
             usage_short(argv[0]);
@@ -339,9 +357,12 @@ main(int argc, char **argv) {
             conf.test_duration = parse_with_multipliers(
                 option, optarg, s_multiplier,
                 sizeof(s_multiplier) / sizeof(s_multiplier[0]));
-            if(conf.test_duration <= 0) {
+            if(conf.test_duration == 0 || conf.test_duration < -1) {
                 fprintf(stderr, "Expected positive --duration=%s\n", optarg);
                 exit(EX_USAGE);
+            }
+            if(conf.test_duration == -1) {
+                conf.test_duration = INFINITY;
             }
             break;
         case 'e':
@@ -609,6 +630,11 @@ main(int argc, char **argv) {
                 exit(EX_USAGE);
             }
             break;
+        case CLI_CONN_OFFSET + 'z': /* --delay-send */
+            engine_params.delay_send = parse_with_multipliers(
+                option, optarg, s_multiplier,
+                sizeof(s_multiplier) / sizeof(s_multiplier[0]));
+            break;
         case CLI_CHAN_OFFSET + 't':
             engine_params.channel_lifetime = parse_with_multipliers(
                 option, optarg, s_multiplier,
@@ -621,6 +647,30 @@ main(int argc, char **argv) {
             break;
         case 'W': /* --websocket: Enable WebSocket framing */
             engine_params.websocket_enable = 1;
+            break;
+        case SSL_OPT: /* --ssl: Enable TLS */
+#ifdef HAVE_OPENSSL
+            engine_params.ssl_enable = 1;
+#else
+            fprintf(stderr, "Compiled without TLS support\n");
+            exit(EX_USAGE);
+#endif
+            break;
+        case SSL_OPT + 'c': /* --ssl-cert: X.509 certificate file */
+#ifdef HAVE_OPENSSL
+            engine_params.ssl_cert = strdup(optarg);
+#else
+            fprintf(stderr, "Compiled without TLS support\n");
+            exit(EX_USAGE);
+#endif
+            break;
+        case SSL_OPT + 'k': /* --ssl-key: SSL private key file */
+#ifdef HAVE_OPENSSL
+            engine_params.ssl_key = strdup(optarg);
+#else
+            fprintf(stderr, "Compiled without TLS support\n");
+            exit(EX_USAGE);
+#endif
             break;
         case CLI_LATENCY + 'c': /* --latency-connect */
             engine_params.latency_setting |= SLT_CONNECT;
@@ -674,6 +724,11 @@ main(int argc, char **argv) {
                 exit(EX_USAGE);
             }
         } break;
+        case 'S': { /* --server */
+            orch_args.enabled = 1;
+            orch_args.server_addr_str = strdup(optarg);
+            resolve_address(optarg, &orch_args.server_addrs);
+        } break;
         default:
             fprintf(stderr, "%s: unknown option\n", option);
             usage_long(argv[0], &default_config);
@@ -681,10 +736,39 @@ main(int argc, char **argv) {
         }
     }
 
+    struct orchestration_data orch_state = {.connected = 0};
+    if(orch_args.enabled) {
+        orch_state = tcpkali_connect_to_orch_server(orch_args);
+        if(!orch_state.connected) {
+            fprintf(stderr,
+                    "Failed to connect to orchestration server at %s\n",
+                    orch_args.server_addr_str);
+            exit(EX_UNAVAILABLE);
+        }
+        TcpkaliMessage_t* msg = tcpkali_wait_for_start_command(&orch_state);
+        if (!msg) {
+            exit(EX_UNAVAILABLE);
+        }
+        if (msg->present != TcpkaliMessage_PR_start) {
+            fprintf(stderr,
+                    "Received wrong message type instead of start\n");
+            exit(EX_UNAVAILABLE);
+        }
+
+        fprintf(stderr, "Received start command from server\n");
+
+        /* Here we should read all the arguments from the start command
+         * and override command line arguments if needed but it's
+         * not implemented yet. Currently all initial arguments should be
+         * specified in command line.
+         */
+    }
+
     int print_stats = isatty(1);
     if(print_stats) {
-        if(tcpkali_init_terminal() == -1) {
-            warning("Dumb terminal, expect unglorified output.\n");
+        const char *note = 0;
+        if(tcpkali_init_terminal(&note) == -1) {
+            warning("Dumb terminal %s, expect unglorified output.\n", note);
             print_stats = 0;
         }
     }
@@ -694,6 +778,27 @@ main(int argc, char **argv) {
         fprintf(stderr, "--header option ignored without --websocket\n");
         exit(EX_USAGE);
     }
+
+#ifdef HAVE_OPENSSL
+    if(engine_params.ssl_enable) {
+            tcpkali_init_ssl();
+
+            /* If server side operation, look into file names */
+            if(conf.listen_port != 0) {
+                if(access(engine_params.ssl_cert, F_OK) == -1) {
+                    fprintf(stderr,
+                            "%s: Can not access X.509 certificate file.\n",
+                            engine_params.ssl_cert);
+                    exit(EX_USAGE);
+                }
+                if(access(engine_params.ssl_key, F_OK) == -1) {
+                    fprintf(stderr, "%s: Can not access SSL private key file\n",
+                            engine_params.ssl_key);
+                    exit(EX_USAGE);
+                }
+            }
+    }
+#endif
 
     if(rate_modulator.latency_target > 1) {
         char *end = 0;
@@ -823,7 +928,7 @@ main(int argc, char **argv) {
     int no_message_to_send =
         (0 == message_collection_estimate_size(
                   &engine_params.message_collection, MSK_PURPOSE_MESSAGE,
-                  MSK_PURPOSE_MESSAGE, MCE_MINIMUM_SIZE));
+                  MSK_PURPOSE_MESSAGE, MCE_MINIMUM_SIZE, WS_SIDE_CLIENT, 0));
 
     /*
      * Message marker mode can be explicitly enabled via --message-marker,
@@ -856,10 +961,18 @@ main(int argc, char **argv) {
                     optname);
             exit(EX_USAGE);
         }
-    } else if(rate_modulator.mode != RM_UNMODULATED) {
+    }
+
+    /*
+     * If we want to get max rate for specific latency
+     * check that we specified the marker for latency measurement
+     */
+    if(rate_modulator.mode != RM_UNMODULATED
+       && !engine_params.latency_marker_expr
+       && !engine_params.message_marker) {
         fprintf(stderr,
                 "--message-rate @<Latency> requires specifying "
-                "--latency-marker as well.\n");
+                "--latency-marker or --message-marker as well.\n");
         exit(EX_USAGE);
     }
 
@@ -871,7 +984,7 @@ main(int argc, char **argv) {
        && no_message_to_send) {
         if(message_collection_estimate_size(
                &engine_params.message_collection, MSK_PURPOSE_MESSAGE,
-               MSK_PURPOSE_MESSAGE, MCE_MAXIMUM_SIZE)
+               MSK_PURPOSE_MESSAGE, MCE_MAXIMUM_SIZE, WS_SIDE_CLIENT, 1)
            > 0) {
             fprintf(stderr,
                     "--message may resolve "
@@ -893,7 +1006,7 @@ main(int argc, char **argv) {
         case NSET_UNSET:
             fprintf(stderr,
                     "NOTE: --write-combine=off presumes --nagle=off.\n");
-            engine_params.nagle_setting = NSET_NODELAY_OFF;
+            engine_params.nagle_setting = NSET_NODELAY_ON;
             break;
         case NSET_NODELAY_OFF: /* --nagle=on */
             warning(
@@ -965,9 +1078,12 @@ main(int argc, char **argv) {
         statsd = 0;
     }
 
-    /* Stop flashing cursor in the middle of status reporting. */
-    if(print_stats)
+    if(print_stats) {
+        /* Stop flashing cursor in the middle of status reporting. */
         tcpkali_disable_cursor();
+        /* Enable nonblocking input */
+        tcpkali_init_kbdinput();
+    }
 
     /* Block term signals so they're not scheduled in the worker threads. */
     block_term_signals();
@@ -1006,7 +1122,7 @@ main(int argc, char **argv) {
     if(conf.max_connections) {
         oc_args.epoch_end = tk_now(TK_DEFAULT) + conf.test_duration;
         if(open_connections_until_maxed_out(PHASE_ESTABLISHING_CONNECTIONS,
-                &oc_args) == OC_CONNECTED) {
+                &oc_args, &orch_state) == OC_CONNECTED) {
             fprintf(stderr, "%s", tcpkali_clear_eol());
             fprintf(stderr, "Ramped up to %d connections.\n",
                     conf.max_connections);
@@ -1035,7 +1151,7 @@ main(int argc, char **argv) {
     /* Reset the test duration after ramp-up. */
     oc_args.epoch_end = tk_now(TK_DEFAULT) + conf.test_duration;
     enum oc_return_value orv = open_connections_until_maxed_out(
-                                    PHASE_STEADY_STATE, &oc_args);
+                                    PHASE_STEADY_STATE, &oc_args, &orch_state);
 
     fprintf(stderr, "%s", tcpkali_clear_eol());
     engine_terminate(eng, oc_args.checkpoint.epoch_start,
@@ -1198,9 +1314,12 @@ usage_long(char *argv0, struct tcpkali_config *conf) {
     "  -w, --workers <N=%ld>%s         Number of parallel threads to use\n"
     "\n"
     "  --ws, --websocket            Use RFC6455 WebSocket transport\n"
+    "  --ssl                        Enable TLS\n"
+    "  --ssl-cert <filename>        X.509 certificate file (default: cert.pem)\n"
+    "  --ssl-key <filename>         Private key file (default: key.pem)\n"
     "  -H, --header <string>        Add HTTP header into WebSocket handshake\n"
     "  -c, --connections <N=%d>      Connections to keep open to the destinations\n"
-    "  --connect-rate <Rate=%g>    Limit number of new connections per second\n"
+    "  --connect-rate <Rate=%g>     Limit number of new connections per second\n"
     "  --connect-timeout <Time=1s>  Limit time spent in a connection attempt\n"
     "  --channel-lifetime <Time>    Shut down each connection after Time seconds\n"
     "  --channel-bandwidth-upstream <Bandwidth>     Limit upstream bandwidth\n"
@@ -1210,6 +1329,7 @@ usage_long(char *argv0, struct tcpkali_config *conf) {
     "               \"silent\"        Do not send data, ignore received data (default)\n"
     "               \"active\"        Actively send messages\n"
     "  -T, --duration <Time=10s>    Exit after the specified amount of time\n"
+    "  --delay-send <Time>          Delay sending data by a specified amount of time\n"
     "\n"
     "  -e, --unescape-message-args  Unescape the message data arguments\n"
     "  -1, --first-message <string> Send this message first, once\n"
@@ -1233,6 +1353,8 @@ usage_long(char *argv0, struct tcpkali_config *conf) {
     "  --statsd-namespace <string>  Metric namespace (default is \"%s\")\n"
     "  --statsd-latency-window <T>  Aggregate latencies in discrete windows\n"
     "\n"
+    "  --server <host:port>         Orchestration server to connect to\n"
+    "\n"
     "Variable units and recognized multipliers:\n"
     "  <N>, <Rate>:  k (1000, as in \"5k\" is 5000), m (1000000)\n"
     "  <SizeBytes>:  k (1024, as in \"5k\" is 5120), m (1024*1024)\n"
@@ -1250,7 +1372,7 @@ usage_long(char *argv0, struct tcpkali_config *conf) {
 static void
 usage_short(char *argv0) {
     if(isatty(fileno(stdout))) {
-        tcpkali_init_terminal();
+        tcpkali_init_terminal(NULL);
     }
 
     fprintf(stdout, "Usage: %s [OPTIONS] [-l <port>] [<host:port>...]\n",
