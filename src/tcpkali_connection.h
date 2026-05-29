@@ -90,6 +90,6 @@ struct connection {
 };
 
 int ssl_setup(struct connection *conn, int sockfd, char *ssl_cert,
-              char *ssl_key);
+              char *ssl_key, char *ssl_server_name);
 
 #endif /* TCPKALI_CONNECTION_H */

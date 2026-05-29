@@ -1759,7 +1759,12 @@ common_connection_init(TK_P_ struct connection *conn, enum conn_type conn_type,
 #endif
     }
     if(largs->params.ssl_enable != 0) {
-        ssl_setup(conn, sockfd, largs->params.ssl_cert, largs->params.ssl_key);
+        if(!ssl_setup(conn, sockfd, largs->params.ssl_cert,
+                      largs->params.ssl_key,
+                      largs->params.ssl_server_name)) {
+            close_connection(TK_A_ conn, CCR_REMOTE);
+            return;
+        }
     }
 }
 
@@ -1992,7 +1997,9 @@ passive_websocket_cb(TK_P_ tk_io *w, int revents) {
             if(conn->conn_blocked & CBLOCKED_ON_WRITE) {
                 revents &= ~TK_WRITE;
             }
-            if(ssl_setup(conn, 0, largs->params.ssl_cert, largs->params.ssl_key)) {
+            if(ssl_setup(conn, 0, largs->params.ssl_cert,
+                         largs->params.ssl_key,
+                         largs->params.ssl_server_name)) {
                 if(conn->conn_blocked & CBLOCKED_ON_INIT) {
                     conn->conn_wish |= CW_READ_INTEREST;
                     conn->conn_wish |= CW_WRITE_INTEREST;
@@ -2472,7 +2479,9 @@ connection_cb(TK_P_ tk_io *w, int revents) {
             if(conn->conn_blocked & CBLOCKED_ON_WRITE) {
                 revents &= ~TK_WRITE;
             }
-            if(ssl_setup(conn, 0, largs->params.ssl_cert, largs->params.ssl_key)) {
+            if(ssl_setup(conn, 0, largs->params.ssl_cert,
+                         largs->params.ssl_key,
+                         largs->params.ssl_server_name)) {
                 if(conn->conn_blocked & CBLOCKED_ON_INIT) {
                     conn->conn_wish |= CW_READ_INTEREST;
                     conn->conn_wish |= CW_WRITE_INTEREST;
@@ -2481,6 +2490,7 @@ connection_cb(TK_P_ tk_io *w, int revents) {
                 }
             } else {
                 close_connection(TK_A_ conn, CCR_REMOTE);
+                return;
             }
         } else {
             return;
@@ -2854,6 +2864,9 @@ connection_free_internals(struct connection *conn) {
     message_collection_free(&conn->message_collection);
 
 #ifdef HAVE_OPENSSL
+    if(conn->ssl_fd) {
+        SSL_free(conn->ssl_fd);
+    }
     if(conn->ssl_ctx) {
         SSL_CTX_free(conn->ssl_ctx);
     }

@@ -5,9 +5,23 @@
 #include "tcpkali_connection.h"
 #include "tcpkali_ssl.h"
 
+static void
+print_ssl_error(const char *action) {
+    unsigned long err = ERR_peek_error();
+    if(err) {
+        char errbuf[256];
+        ERR_error_string_n(err, errbuf, sizeof(errbuf));
+        fprintf(stderr, "%s: %s\n", action, errbuf);
+        ERR_print_errors_fp(stderr);
+    } else {
+        fprintf(stderr, "%s: no OpenSSL error available\n", action);
+    }
+}
+
 int
 ssl_setup(struct connection UNUSED *conn, int UNUSED sockfd,
-          char UNUSED *ssl_cert, char UNUSED *ssl_key) {
+          char UNUSED *ssl_cert, char UNUSED *ssl_key,
+          char UNUSED *ssl_server_name) {
 #ifdef HAVE_OPENSSL
     conn->conn_blocked = 0;
     if(conn->ssl_ctx == NULL) {
@@ -20,15 +34,13 @@ ssl_setup(struct connection UNUSED *conn, int UNUSED sockfd,
                                        : TLS_server_method();
 #endif
         if(method == NULL) {
-            fprintf(stderr, "Can not create SSL method %lu\n", ERR_get_error());
-            ERR_print_errors_fp(stderr);
+            print_ssl_error("Can not create SSL method");
             exit(1);
         }
         conn->ssl_ctx = SSL_CTX_new(method);
     }
     if(conn->ssl_ctx == NULL) {
-        fprintf(stderr, "Can not create SSL context %lu\n", ERR_get_error());
-        ERR_print_errors_fp(stderr);
+        print_ssl_error("Can not create SSL context");
         exit(1);
     } else {
         if(conn->conn_type == CONN_INCOMING) {
@@ -52,6 +64,12 @@ ssl_setup(struct connection UNUSED *conn, int UNUSED sockfd,
         }
         if(!conn->ssl_fd) {
             conn->ssl_fd = SSL_new(conn->ssl_ctx);
+            if(conn->conn_type == CONN_OUTGOING && ssl_server_name) {
+                if(!SSL_set_tlsext_host_name(conn->ssl_fd, ssl_server_name)) {
+                    print_ssl_error("Can not set TLS server name");
+                    return 0;
+                }
+            }
             SSL_set_fd(conn->ssl_fd, sockfd);
             switch(conn->conn_type) {
             case CONN_OUTGOING:
@@ -90,9 +108,9 @@ ssl_setup(struct connection UNUSED *conn, int UNUSED sockfd,
             conn->conn_blocked |= CBLOCKED_ON_WRITE;
             break;
         default:
-            fprintf(stderr, "Can not create SSL connect %lu\n",
-                    ERR_get_error());
-            ERR_print_errors_fp(stderr);
+            print_ssl_error(conn->conn_type == CONN_OUTGOING
+                                ? "Can not establish SSL connection"
+                                : "Can not accept SSL connection");
             return 0;
         }
         if(status < 0) {

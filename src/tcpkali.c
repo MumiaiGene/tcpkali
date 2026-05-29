@@ -162,6 +162,7 @@ static double parse_with_multipliers(const char *, char *str,
                                      struct multiplier *, int n);
 static int parse_percentile_values(const char *option, char *str,
                                    struct percentile_values *array);
+static char *tls_server_name_from_hostport(const char *hostport);
 
 /* clang-format off */
 static struct multiplier km_multiplier[] = { { "k", 1000 }, { "m", 1000000 } };
@@ -898,6 +899,10 @@ main(int argc, char **argv) {
         } else {
             conf.first_path = ""; /* "GET / HTTP/1.1" */
         }
+        if(engine_params.ssl_enable) {
+            engine_params.ssl_server_name =
+                tls_server_name_from_hostport(conf.first_hostport);
+        }
 
         /* Figure out source IPs */
         if(engine_params.source_addresses.n_addrs == 0) {
@@ -1368,6 +1373,41 @@ usage_long(char *argv0, struct tcpkali_config *conf) {
         conf->max_connections, conf->connect_rate,
         conf->statsd_enable ? "enabled" : "disabled", conf->statsd_port,
         conf->statsd_namespace);
+}
+
+static char *
+tls_server_name_from_hostport(const char *hostport) {
+    const char *end;
+    int has_name_char = 0;
+    size_t len;
+    char *server_name;
+
+    if(!hostport || !*hostport) return NULL;
+
+    if(hostport[0] == '[') {
+        return NULL;
+    }
+
+    end = strchr(hostport, ':');
+    if(!end) end = hostport + strlen(hostport);
+
+    len = end - hostport;
+    if(len == 0) return NULL;
+
+    for(size_t i = 0; i < len; i++) {
+        char c = hostport[i];
+        if((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            has_name_char = 1;
+            break;
+        }
+    }
+    if(!has_name_char) return NULL;
+
+    server_name = malloc(len + 1);
+    assert(server_name);
+    memcpy(server_name, hostport, len);
+    server_name[len] = '\0';
+    return server_name;
 }
 
 static void

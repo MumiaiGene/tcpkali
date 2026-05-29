@@ -74,6 +74,7 @@ struct engine_params {
     int ssl_enable;       /* Enable SSL/TLS */
     char *ssl_cert;       /* SSL/TLS cert file */
     char *ssl_key;        /* SSL/TLS key file */
+    char *ssl_server_name; /* TLS SNI server name */
     /* Pre-computed message data template */
     struct message_collection message_collection;  /* A descr. what to send */
     struct transport_data_spec *data_templates[2]; /* client, server tmpls */
