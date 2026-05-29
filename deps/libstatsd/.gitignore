@@ -3,6 +3,7 @@
 *.cache
 *.in
 *.m4
+!libstatsd.m4
 config.*
 configure
 depcomp

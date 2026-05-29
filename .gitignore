@@ -12,6 +12,7 @@
 deps/libev/ev.3
 
 m4/*
+!m4/ax_*.m4
 config/
 autom4te.cache
 
