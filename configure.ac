@@ -2,10 +2,13 @@ AC_INIT([tcpkali],[1.2.0],[lwalkin@machinezone.com])
 
 AC_CONFIG_SRCDIR([src/tcpkali.c])
 AC_CONFIG_AUX_DIR(config)
-AM_INIT_AUTOMAKE(foreign)
+AM_INIT_AUTOMAKE([foreign subdir-objects])
 AC_CONFIG_MACRO_DIR(m4)
 
 AC_CONFIG_HEADER([config.h])
+
+: ${AR_FLAGS=cr}
+AC_SUBST([AR_FLAGS])
 
 LT_INIT
 

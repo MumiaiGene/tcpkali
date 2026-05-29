@@ -3,6 +3,9 @@
  * Redistribution and modifications are permitted subject to BSD license.
  */
 #define	_ISOC99_SOURCE		/* For ilogb() and quiet NAN */
+#ifndef _DEFAULT_SOURCE
+#define	_DEFAULT_SOURCE		/* To reintroduce finite(3) */
+#endif
 #ifndef _BSD_SOURCE
 #define	_BSD_SOURCE		/* To reintroduce finite(3) */
 #endif
@@ -1004,4 +1007,3 @@ REAL_random_fill(const asn_TYPE_descriptor_t *td, void **sptr,
     result_ok.length = st->size;
     return result_ok;
 }
-

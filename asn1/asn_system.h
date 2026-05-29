@@ -12,8 +12,11 @@
 #include "config.h"
 #endif
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE /* for snprintf() on modern glibc systems */
+#endif
 #ifndef _BSD_SOURCE
-#define _BSD_SOURCE /* for snprintf() on some linux systems  */
+#define _BSD_SOURCE /* for snprintf() on older linux systems */
 #endif
 
 #include <stdio.h>	/* For snprintf(3) */

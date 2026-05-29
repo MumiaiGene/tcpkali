@@ -324,7 +324,7 @@ process_orch_events(struct oc_args *args,
         free_orch_message(msg);
         return 0;
     default:
-        fprintf(stderr, "Received unknown command from server %zd\n",
+        fprintf(stderr, "Received unknown command from server %d\n",
                 msg->present);
     }
     free_orch_message(msg);
@@ -641,4 +641,3 @@ free_orch_message(TcpkaliMessage_t *msg) {
         ASN_STRUCT_FREE(asn_DEF_TcpkaliMessage, msg);
     }
 }
-

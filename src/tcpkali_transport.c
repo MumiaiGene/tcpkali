@@ -331,6 +331,7 @@ ws_header_size_estimate(enum mc_snippet_estimate mce,
         return client_size < server_size ? client_size : server_size;
     };
     }
+    abort();
 }
 
 /*
